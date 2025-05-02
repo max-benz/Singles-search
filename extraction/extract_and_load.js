@@ -4,21 +4,29 @@ const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
 const {
-  GWAPPS_API_KEY, GWAPPS_EMAIL, GWAPPS_CUSTOMER_ID, GWAPPS_FORM_ID,
-  NEXT_PUBLIC_SUPABASE_URL, SERVICE_ROLE_KEY, SUPABASE_BUCKET_NAME
+  GWAPPS_API_KEY,
+  GWAPPS_EMAIL,
+  GWAPPS_CUSTOMER_ID,
+  GWAPPS_FORM_ID,
+  NEXT_PUBLIC_SUPABASE_URL,
+  SERVICE_ROLE_KEY,
+  SUPABASE_BUCKET_NAME
 } = process.env;
 
-// 1) Authenticate
+// 1) Authenticate with GW Apps
 async function getGwToken() {
-  const res = await axios.post('https://api.gwapps.com/v1/token', {
-    key: GWAPPS_API_KEY,
-    email: GWAPPS_EMAIL,
-    customerId: GWAPPS_CUSTOMER_ID
-  });
+  const res = await axios.post(
+    'https://api.gwapps.com/v1/token',
+    {
+      key: GWAPPS_API_KEY,
+      email: GWAPPS_EMAIL,
+      customerId: GWAPPS_CUSTOMER_ID
+    }
+  );
   return res.data.access_token;
 }
 
-// 2) Fetch records
+// 2) Fetch all records
 async function fetchRecords(token) {
   const res = await axios.get(
     `https://api.gwapps.com/v1/forms/${GWAPPS_FORM_ID}/records`,
@@ -27,7 +35,7 @@ async function fetchRecords(token) {
   return res.data.records || [];
 }
 
-// 3) Init Supabase
+// 3) Initialize Supabase client (service role key)
 const supabase = createClient(NEXT_PUBLIC_SUPABASE_URL, SERVICE_ROLE_KEY);
 
 async function main() {
@@ -35,23 +43,36 @@ async function main() {
   const records = await fetchRecords(token);
 
   for (let rec of records) {
-    const id = rec.id, f = rec.fields;
-    let imageUrls = [];
+    // -- guard against missing 'fields'
+    if (!rec.fields) {
+      console.warn(`⚠️  Record ${rec.id} has no fields—skipping.`);
+      continue;
+    }
+    const f = rec.fields;
+    const id = rec.id;
 
-    // download & re-upload each image
-    for (let img of (f.images_extern1 || [])) {
-      const imgRes = await axios.get(img.url, { responseType: 'arraybuffer' });
-      const path   = `${id}/${img.name}`;
-      await supabase.storage
-        .from(SUPABASE_BUCKET_NAME)
-        .upload(path, Buffer.from(imgRes.data), { upsert: true });
-      const { publicURL } = supabase.storage
-        .from(SUPABASE_BUCKET_NAME)
-        .getPublicUrl(path);
-      imageUrls.push(publicURL);
+    // -- collect & upload images
+    const imageUrls = [];
+    const attachments = Array.isArray(f.images_extern1) ? f.images_extern1 : [];
+    for (let img of attachments) {
+      try {
+        const imgRes = await axios.get(img.url, { responseType: 'arraybuffer' });
+        const path   = `${id}/${img.name}`;
+        await supabase
+          .storage
+          .from(SUPABASE_BUCKET_NAME)
+          .upload(path, Buffer.from(imgRes.data), { upsert: true });
+        const { publicURL } = supabase
+          .storage
+          .from(SUPABASE_BUCKET_NAME)
+          .getPublicUrl(path);
+        imageUrls.push(publicURL);
+      } catch(e) {
+        console.error(`Failed to process image for ${id}:`, e.message);
+      }
     }
 
-    // build payload
+    // -- build payload (skipping undefined fields is fine)
     const payload = {
       id,
       first_name:          f.text_field2,
@@ -110,10 +131,20 @@ async function main() {
       images: imageUrls
     };
 
-    // insert/update
-    await supabase.from('singles').upsert(payload);
-    console.log(`Imported ${id}`);
+    // 4) Upsert into Supabase
+    const { error } = await supabase
+      .from('singles')
+      .upsert(payload);
+
+    if (error) {
+      console.error(`❌  Failed to upsert record ${id}:`, error.message);
+    } else {
+      console.log(`✅  Imported ${id}`);
+    }
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
